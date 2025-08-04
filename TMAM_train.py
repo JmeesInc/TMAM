@@ -30,8 +30,7 @@ from monai.losses import GeneralizedDiceFocalLoss
 from train import Dataset as TrainDataset
 
 from base_model.alt_model import TimmSegModel_v3 as UNET ###
-#from util.converter2 import VideoSegModel
-from util.converter2 import VideoSegModel2 as VideoSegModel ## for deeplabv3+
+from TMAM.util.model import TMAM
 from util.data import TestDataset
 
 import sys
@@ -452,7 +451,7 @@ def main():
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     from sam2.build_sam import build_sam2_video_predictor
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device="cuda",)
-    model2 = VideoSegModel(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=CFG.depth)
+    model2 = TMAM(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=CFG.depth)
             # Initialize optimizer and criterion
     #model2 = torch.compile(model2)
     optimizer = RAdamScheduleFree(model2.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
@@ -460,7 +459,6 @@ def main():
     #model2.load_state_dict(fix_key(torch.load(CFG.model_path)), strict=False)
     for epoch in range(3):
         train(model2, train_loader, optimizer, train_criterion, CFG.device)
-        #model2 = VideoSegModel(model2.encoder, model2.decoder, model2.seg_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(60)], depth=CFG.depth)
         torch.save(model2.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
         val_loss = validate(model2, val_loader, valid_criterion, CFG.device, optimizer)
         torch.save(model2.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")

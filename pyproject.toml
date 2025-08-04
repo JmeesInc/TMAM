@@ -1,0 +1,33 @@
+[project]
+name = "miccai2025"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "apex>=0.9.10.dev0",
+    "ipykernel>=6.29.5",
+    "jupyter>=1.1.1",
+    "kornia>=0.8.0",
+    "matplotlib>=3.10.3",
+    "memory-profiler>=0.61.0",
+    "monai>=1.4.0",
+    "opencv-python>=4.11.0.86",
+    "pandas>=2.3.0",
+    "schedulefree>=1.4",
+    "scikit-learn>=1.7.0",
+    "scipy>=1.15.1",
+    "segmentation-models-pytorch>=0.4.0",
+    "setuptools>=61.0",
+    "tensordict>=0.6.2",
+    "timm>=1.0.13",
+    "torch>=2.5.1",
+    "torchmetrics>=1.6.1",
+]
+
+[project.optional-dependencies]
+build = ["torch", "setuptools"]
+compile = ["flash-attn"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]

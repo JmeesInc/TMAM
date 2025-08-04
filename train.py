@@ -42,7 +42,7 @@ class CFG:
     depth = 4
     autocast = True
     image_size=1024
-    data_dir = "/mnt/ssd1/EndoVis2022/train/"
+    data_dir = "EndoVis2022/train/"
     num_epochs = 50
     batch_size = 8
     learning_rate = 2e-4
@@ -67,18 +67,6 @@ class Dataset(BaseDataset):
             image_paths = [p.replace("segmentation", "rgb") for p in mask_paths]
             self.mask_paths.extend(mask_paths)
             self.image_paths.extend(image_paths)
-        '''if train:
-            with open("configs/train_7.txt", "r") as f:
-                mask_7 = f.readlines()
-            mask_7 = [s.replace("\n", "") for s in mask_7]
-            train_7 = [s.replace("segmentation", "rgb") for s in mask_7]
-            with open("configs/train_6.txt", "r") as f:
-                mask_6 = f.readlines()
-            mask_6 = [s.replace("\n", "") for s in mask_6]
-            mask_6.extend(mask_6)
-            train_6 = [s.replace("segmentation", "rgb") for s in mask_6]
-            self.mask_paths = self.mask_paths + mask_6 + mask_7
-            self.image_paths = self.image_paths + train_6 + train_7'''
 
     def __len__(self):
         return len(self.image_paths)
@@ -294,7 +282,6 @@ def main(rank=0, world_size=1):
             backbone=CFG.backbone,
             out_dim=CFG.mask_num,
         )
-    model.load_state_dict(fix_key(torch.load(CFG.model_path)))#########
     model = model.to(device)
     model = torch.compile(model)
     

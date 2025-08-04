@@ -156,27 +156,7 @@ def main():
     dir_length = len(glob(f'{CFG.check_video}/rgb/*.png'))
     # Load video frames and segmentations (example paths)
     video_frames = [f'{CFG.check_video}/rgb/{i:09}.png' for i in range(0, dir_length, 1)]
-    #segmentations = [cv2.imread(f'{CFG.check_video}/{CFG.save_syntax}/{i:09}.png', cv2.IMREAD_GRAYSCALE) for i in range(0, dir_length, 1)]
-    '''segmentations = [f'{CFG.check_video}/ablation_{CFG.save_syntax}/{i:09}.png' for i in range(0, dir_length, 1)]
-    #segmentations = [cv2.resize(a, (1920,1080), interpolation=cv2.INTER_NEAREST) for a in segmentations]
-    if CFG.save_syntax == "tf_efficientnet_b7":
-        if CFG.check_video == "/mnt/ssd1/EndoVis2022/train/video_18":
-            segmentations = segmentations[:19588]
-            video_frames = video_frames[:19588]
-            dir_length = 19588
-    raft_model = initialize_raft_model()
-
-    mean_tc = evaluate_temporal_consistency(raft_model, video_frames, segmentations, save_plot_name="frame")
-    print(f"frame - Mean Temporal Consistency for video {CFG.plot_name}: ")
-    for i, tc in enumerate(mean_tc):
-        print(f"id {i}: {tc:.4f}")'''
-
     segmentations = [f'{CFG.check_video}/video_{CFG.save_syntax}/{i:09}.png' for i in range(0, dir_length, 1)]
-    if CFG.save_syntax == "tf_efficientnet_b7":
-        if CFG.check_video == "/mnt/ssd1/EndoVis2022/train/video_18":
-            segmentations = segmentations[:19588]
-    #segmentations = [recover_segmentation(a) for a in segmentations]
-    #segmentations = [cv2.resize(a, (1920,1080), interpolation=cv2.INTER_NEAREST) for a in segmentations]
     raft_model = initialize_raft_model()
 
     mean_tc = evaluate_temporal_consistency(raft_model, video_frames, segmentations, save_plot_name="video")
@@ -186,7 +166,7 @@ def main():
     
     
 
-    segmentations = [cv2.imread(f'/mnt/ssd1/EndoVis2022/train/{CFG.plot_name}/segmentation/{i:09}.png', cv2.IMREAD_GRAYSCALE) for i in range(0, dir_length, 60)]
+    segmentations = [cv2.imread(f'{CFG.plot_name}/segmentation/{i:09}.png', cv2.IMREAD_GRAYSCALE) for i in range(0, dir_length, 60)]
     class_freq = {}
     array = np.array(segmentations)
     for i in range(10):
@@ -196,12 +176,6 @@ def main():
         class_freq[i] = class_freq[i] / sum_freq
     frame_score = np.load(f"plot/{CFG.save_syntax}_1/{CFG.plot_name}/frame.npy")
     video_score = np.load(f"plot/{CFG.save_syntax}_1/{CFG.plot_name}/video.npy")
-    #gt_score = np.load(f"plot/{CFG.save_syntax}_1/{CFG.plot_name}/gt.npy")
-    
-    #frame_norm = frame_score / (gt_score + 1e-2)
-    #video_norm = video_score / (gt_score + 1e-2)
-    #frame_norm[frame_norm > 1] = 1
-    #video_norm[video_norm > 1] = 1
     frame_norm = frame_score
     video_norm = video_score
     for i in range(frame_norm.shape[1]):
