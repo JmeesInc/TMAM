@@ -1,6 +1,13 @@
+import os
+def set_env():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+    os.environ["SAM2_BUILD_CUDA"] = "0"
+    os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
+set_env()
+
 import torch
 import numpy as np
-import os
 import cv2
 import time
 import torch.nn as nn
@@ -16,87 +23,54 @@ from schedulefree import RAdamScheduleFree
 import pandas as pd
 import torch.nn.functional as F
 
-def set_env():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-    os.environ["SAM2_BUILD_CUDA"] = "0"
-    os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
-    k = torch.randn(1)
-    k = k.cuda()
-    del k
-    torch.cuda.empty_cache()
-    gc.collect()
-
-def convert_batch_norm_to_group_norm(model, num_groups=32):
-    """BatchNorm2dをGroupNormに変換してバッチサイズ1に対応（より簡単な方法）"""
-    import torch.nn as nn
-    
-    for name, module in model.named_modules():
-        if isinstance(module, nn.BatchNorm2d):
-            # GroupNormに変換
-            new_module = nn.GroupNorm(
-                num_groups=min(num_groups, module.num_features),
-                num_channels=module.num_features,
-                eps=module.eps,
-                affine=module.affine
-            )
-            # 重みをコピー
-            if module.affine:
-                new_module.weight.data = module.weight.data.clone()
-                new_module.bias.data = module.bias.data.clone()
-            
-            # 親モジュールで置き換え
-            parent_name = '.'.join(name.split('.')[:-1])
-            child_name = name.split('.')[-1]
-            if parent_name:
-                parent = dict(model.named_modules())[parent_name]
-                setattr(parent, child_name, new_module)
-            else:
-                setattr(model, child_name, new_module)
-    return model
-
-set_env()
-
+import sys
+sys.path.append("./sam2")
+from sam2.build_sam import build_sam2_video_predictor
 from monai.losses import GeneralizedDiceFocalLoss
 
-from base_model.alt_model import TimmSegModel_v3 as UNET
-from util.converter2 import VideoSegModel2 as VideoSegModel
-from util.data import TestDataset
+import segmentation_models_pytorch as smp
+from util.model import TMAM, replace_batch_norm_with_group_norm
 import kornia.augmentation as K
+from torchvision.transforms.v2 import TrivialAugmentWide
 
 import sys
 sys.path.append("./sam2")
 
 class CFG:
-    backbone = "resnet101.a1h_in1k"
-    save_syntax = "resnet101_bin"
+    backbone = "tu-resnet101"
+    save_syntax = "resnet101-deeplabv3-cholec"
     decoder = "deeplabv3"
+    depth = 4
     autocast = True
-    image_size= 512
+    image_size=512
+    
+    num_epochs = 50
+    mask_num=13
+    batch_size = 1
+    learning_rate = 1e-4
+    train_augmentation = TrivialAugmentWide()
+
     train_csv = "cholecseg8k_train.csv"
     valid_csv = "cholecseg8k_test.csv"
-    model_path = "base_model/weight/cholec/resnet101_bin.pth"
-    num_epochs = 5
-    batch_size = 1
+    load_model_path = f"base_model/weight/{save_syntax}.pth"
+    save_model_path = f"base_model/weight/TMAM_{save_syntax}.pth"
+    num_epochs = 3
     accum_steps = 8
     learning_rate = 1e-4
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # マルチGPUを使用するかどうかのフラグ
-    world_size = 1#torch.cuda.device_count()
-    use_multi_gpu = False#True if torch.cuda.device_count() > 1 else False
+    world_size = torch.cuda.device_count()
+    use_multi_gpu = True if torch.cuda.device_count() > 1 else False
     dist_url = 'tcp://localhost:12355'
     dist_backend = 'nccl'
-    train_augmentation = K.AugmentationSequential(
-        K.auto.TrivialAugment(),
-        data_keys=["input", "mask"],
-    )
-    mask_num=13
+
+    model_path = f"base_model/weight/{save_syntax}.pth"
     LABEL2CH = {
         0: 0,  50: 0, 255: 0, 
         5: 1,  11: 2, 12: 3, 13: 4,
         21: 5,  22: 6, 23: 7, 24: 8,
         25: 9,  31:10, 32:11, 33:12
     }
-    NUM_CLASSES = 13
 
 
 class Dataset(BaseDataset):
@@ -123,7 +97,7 @@ class Dataset(BaseDataset):
         mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
         idx_mask = np.vectorize(CFG.LABEL2CH.get, otypes=[np.uint8])(mask_raw)
-        mask = np.eye(CFG.NUM_CLASSES, dtype=np.float32)[idx_mask]
+        mask = np.eye(CFG.mask_num, dtype=np.float32)[idx_mask]
 
         video_start = self.video_starts.iloc[idx]
 
@@ -196,7 +170,6 @@ def validate(model, loader, criterion, device, optimizer=None):
                     video_name = Path(mask_paths[0]).parent.parent.name
                     save_dir = f"/data4/shared/CholecSeg8k_save/{CFG.save_syntax}/{video_name}/"
                     os.makedirs(save_dir, exist_ok=True)
-                    print(f"Saving video to {save_dir}")
                 
                 frame_name = Path(mask_paths[0]).name.replace('_watershed_mask.png', '.png')
                 file_name = f"{save_dir}/{frame_name}"
@@ -248,7 +221,6 @@ def validate(model, loader, criterion, device, optimizer=None):
                 torch.cuda.empty_cache()
                 gc.collect()
 
-    # 各クラスの平均DiceScoreを計算
     mean_dice_scores = []
     for class_idx in range(CFG.mask_num):
         if len(class_dice_scores[class_idx]) > 0:
@@ -259,7 +231,6 @@ def validate(model, loader, criterion, device, optimizer=None):
             mean_dice_scores.append(0.0)
             print(f"Class {class_idx} | Dice Score: 0.0000 (no samples)")
     
-    # 全体の平均DiceScore
     overall_mean_dice = np.mean(mean_dice_scores)
     print(f"Overall Mean Dice Score: {overall_mean_dice:.4f}")
     
@@ -277,126 +248,24 @@ def fix_key(state_dict):
         new_state_dict[k] = v
     return new_state_dict
 
-def create_compare_video(out_path, video_dirs):
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    w, h = 512*3, 512
-    out = cv2.VideoWriter(out_path, fourcc, 25, (w, h))
-
-    image_files = []
-    for video_dir in video_dirs:
-        video_name = Path(video_dir).name
-        # Assuming original data is in a structured path
-        original_image_dir = f"/data4/shared/CholecSeg8k/{video_name}/"
-        image_files.extend(sorted(glob(f"{original_image_dir}/*.png")))
-
-    for image_file in tqdm(image_files, desc="Creating comparison video"):
-        frame_name = Path(image_file).name
-        video_name = Path(image_file).parent.name
-        
-        pred_dir = original_image_dir
-        pred_file = f"{pred_dir}/{frame_name}"
-        
-        truth_file = image_file.replace(f"videos/{video_name}", f"annotations/{video_name}").replace(".png", "_watershed_mask.png")
-
-        if not os.path.exists(pred_file) or not os.path.exists(truth_file):
-            continue
-
-        pred_mask = cv2.imread(pred_file, cv2.IMREAD_GRAYSCALE)
-        pred_mask = cv2.resize(pred_mask, (512, 512), interpolation=cv2.INTER_NEAREST)
-        pred_mask = cv2.applyColorMap((pred_mask * 20).astype(np.uint8), cv2.COLORMAP_JET)
-
-        image = cv2.imread(image_file)
-        image = cv2.resize(image, (512, 512))
-        
-        truth_mask_raw = cv2.imread(truth_file, cv2.IMREAD_GRAYSCALE)
-        truth_mask_idx = np.vectorize(CFG.LABEL2CH.get, otypes=[np.uint8])(truth_mask_raw)
-        truth_mask = cv2.resize(truth_mask_idx, (512, 512), interpolation=cv2.INTER_NEAREST)
-        truth_mask = cv2.applyColorMap((truth_mask * 20).astype(np.uint8), cv2.COLORMAP_JET)
-        
-        write_frame = np.hstack([image, pred_mask, truth_mask])
-        
-        out.write(write_frame)
-    out.release()
-    print(f"Comparison video saved to {out_path}")
-
-from torch.nn import SyncBatchNorm
-
-def replace_batch_norm_with_group_norm(model, num_groups=32):
-    """BatchNorm2dをGroupNormに変換してバッチサイズ1に対応"""
-    import torch.nn as nn
-    
-    def get_valid_num_groups(num_channels, target_groups):
-        """チャンネル数がグループ数で割り切れるようにグループ数を調整"""
-        if num_channels < target_groups:
-            return 1
-        # チャンネル数の約数を探す
-        for i in range(min(target_groups, num_channels), 0, -1):
-            if num_channels % i == 0:
-                return i
-        return 1  # デフォルトは1
-    
-    def replace_in_module(module):
-        """再帰的にモジュール内のBatchNorm2dをGroupNormに置き換え"""
-        for name, child in list(module.named_children()):
-            if isinstance(child, nn.BatchNorm2d):
-                # 有効なグループ数を計算
-                valid_groups = get_valid_num_groups(child.num_features, num_groups)
-                
-                # GroupNormに変換
-                new_module = nn.GroupNorm(
-                    num_groups=valid_groups,
-                    num_channels=child.num_features,
-                    eps=child.eps,
-                    affine=child.affine
-                )
-                # 重みをコピー
-                if child.affine:
-                    new_module.weight.data = child.weight.data.clone()
-                    new_module.bias.data = child.bias.data.clone()
-                
-                # モジュールを置き換え
-                setattr(module, name, new_module)
-                print(f"Replaced BatchNorm2d with GroupNorm: {name} (channels: {child.num_features}, groups: {valid_groups})")
-            else:
-                # 再帰的に子モジュールを処理
-                replace_in_module(child)
-    
-    replace_in_module(model)
-    return model
-
 
 def main():
-    set_env()
-    model = UNET(
-        backbone=CFG.backbone,
-        out_dim=CFG.mask_num,
-        segtype=CFG.decoder
+    set_env()    
+    model = smp.DeepLabV3Plus(
+        encoder_name=CFG.backbone,
+        classes=CFG.mask_num
     )
-    
-    # BatchNorm2dをSyncBatchNormに変換してバッチサイズ1に対応
-    model = replace_batch_norm_with_group_norm(model)
-    
+    model.load_state_dict(torch.load(CFG.load_model_path), strict=False)
     model.eval()
-    print(model(torch.randn(1, 3, 512, 512)).shape)
-    if os.path.exists(CFG.model_path):
-        print("Loading pre-trained weights...")
-        model.load_state_dict(fix_key(torch.load(CFG.model_path)), strict=False)
-    else:
-        print("No pre-trained weights found, starting from scratch.")
     
+    model = replace_batch_norm_with_group_norm(model) # Since TMAM is trained with batch size 1, we need to replace batch norm with group norm
     model.to(CFG.device)
-    # データセットの準備
-    train_df = pd.read_csv(CFG.train_csv)
-    val_df = pd.read_csv(CFG.valid_csv)
-
-    print(f"Train frames: {len(train_df)}")
-    print(f"Val frames: {len(val_df)}")
+    
+    train_df = pd.read_csv("cholecseg8k_train.csv")
+    valid_df = pd.read_csv("cholecseg8k_test.csv")
 
     train_dataset = Dataset(train_df)
-    val_dataset = Dataset(val_df)
-
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size: {len(val_dataset)}")
+    val_dataset = Dataset(valid_df)
 
     train_loader = DataLoader(
         train_dataset,
@@ -417,19 +286,17 @@ def main():
     )
     
     valid_criterion = DiceScore(num_classes=CFG.mask_num, average='none', include_background=False)
-    
-    
-    sam2_checkpoint = "sam2/checkpoints/sam2.1_hiera_large.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-    from sam2.build_sam import build_sam2_video_predictor
-    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device="cuda")
 
-    model2 = VideoSegModel(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=-1)
+    predictor = build_sam2_video_predictor(
+        "configs/sam2.1/sam2.1_hiera_l.yaml", 
+        "sam2/checkpoints/sam2.1_hiera_large.pt", 
+        device="cuda")
+
+    model2 = TMAM(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=-1)
 
     if os.path.exists(f"base_model/weight/cholec/fine_tune_{CFG.save_syntax}.pth"):
         model2.load_state_dict(fix_key(torch.load(f"base_model/weight/cholec/fine_tune_{CFG.save_syntax}.pth")), strict=False)
 
-    # Initialize optimizer and criterion
     optimizer = RAdamScheduleFree(model2.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
     train_criterion = GeneralizedDiceFocalLoss(softmax=True)
     
@@ -437,9 +304,6 @@ def main():
     for epoch in range(CFG.num_epochs):
         print(f"\n--- Epoch {epoch+1}/{CFG.num_epochs} ---")
         train(model2, train_loader, optimizer, train_criterion, CFG.device)
-        
-        # Configure model for validation (longer memory)
-        #model2_val = VideoSegModel(model2.encoder, model2.decoder, model2.seg_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(60)])
         val_loss = validate(model2, val_loader, valid_criterion, CFG.device, optimizer)
         print(f"Val Score: {val_loss:.4f}")
         
@@ -449,12 +313,6 @@ def main():
             print("Saved best model!")
 
     print(f"Best Val Score: {best_val_score:.4f}")
-
-    val_video_dirs = val_df['file'].apply(lambda x: str(Path(x).parent.parent)).unique().tolist()
-    #create_compare_video(
-    #    out_path=f"/home/shunsuke/MICCAI2025/log/cholec_{CFG.save_syntax}_compare.mp4",
-    #    video_dirs=val_video_dirs
-    #)
 
 if __name__ == "__main__":
     set_env()

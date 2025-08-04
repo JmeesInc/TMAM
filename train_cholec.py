@@ -1,26 +1,16 @@
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
-import torch
-torch.backends.cudnn.benchmark = True
 import torch
 import numpy as np
-import pandas as pd
 import cv2
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as BaseDataset
 from glob import glob
 from tqdm import tqdm
-from pathlib import Path
-from torchmetrics.segmentation import MeanIoU, DiceScore
+import pandas as pd
+from torchmetrics.segmentation import DiceScore
+import segmentation_models_pytorch as smp
 
 from monai.losses import GeneralizedDiceFocalLoss
 from schedulefree import RAdamScheduleFree
-#from monai.metrics import MeanIoU
-import kornia.augmentation as K
 
 from util import vis
 from util.data import TestDataset
@@ -31,35 +21,44 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from collections import OrderedDict
+from torchvision.transforms.v2 import TrivialAugmentWide
 
-from base_model.alt_model import TimmSegModel as UNET
-#from segmentation_models_pytorch import DeepLabV3Plus
+def set_env():
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+    torch.backends.cudnn.benchmark = True
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+set_env()
 
 class CFG:
-    backbone = "tf_efficientnet_b7.ns_jft_in1k"
-    save_syntax = "tf_efficientnet_b7"
-    decoder = "unet"
+    backbone = "tu-resnet101"
+    save_syntax = "resnet101-deeplabv3-cholec"
+    decoder = "deeplabv3"
     depth = 4
     autocast = True
     image_size=512
-    num_epochs = 25
+    
+    num_epochs = 50
+    mask_num=13
     batch_size = 32
-    learning_rate = 2e-4
+    learning_rate = 1e-4
+    train_augmentation = TrivialAugmentWide()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # マルチGPUを使用するかどうかのフラグ
     world_size = torch.cuda.device_count()
     use_multi_gpu = True if torch.cuda.device_count() > 1 else False
     dist_url = 'tcp://localhost:12355'
     dist_backend = 'nccl'
-    train_augmentation = None
-    model_path = f"base_model/weight/cholec/{save_syntax}.pth"
-    mask_num=13
+
+    model_path = f"base_model/weight/{save_syntax}.pth"
     LABEL2CH = {
         0: 0,  50: 0, 255: 0, 
         5: 1,  11: 2, 12: 3, 13: 4,
         21: 5,  22: 6, 23: 7, 24: 8,
         25: 9,  31:10, 32:11, 33:12
     }
-    NUM_CLASSES = 13
 
 class CholecSegDataset(torch.utils.data.Dataset):
     def __init__(self, df, transform=None):
@@ -77,7 +76,7 @@ class CholecSegDataset(torch.utils.data.Dataset):
 
         idx_mask = np.vectorize(CFG.LABEL2CH.get, otypes=[np.uint8])(mask_raw)
 
-        mask_onehot = np.eye(CFG.NUM_CLASSES, dtype=np.float32)[idx_mask].transpose(2, 0, 1)
+        mask_onehot = np.eye(CFG.mask_num, dtype=np.float32)[idx_mask].transpose(2, 0, 1)
 
         image = cv2.resize(image, (CFG.image_size, CFG.image_size), interpolation=cv2.INTER_LINEAR)
         image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
@@ -97,29 +96,23 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     optimizer.train()
     epoch_loss = 0
-    #augmentation = CFG.train_augmentation.to(device)
     scaler = torch.GradScaler(enabled=CFG.autocast)
     
     with tqdm(loader, desc="Training") as pbar:
         for images, masks in pbar:
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-            #augmented = augmentation(images, masks)
-            #images, masks = augmented[0], augmented[1]
             
             optimizer.zero_grad()
             
             with torch.autocast("cuda", dtype=torch.float16, enabled=CFG.autocast):
-                # Forward pass
                 outputs = model(images)
                 loss = criterion(outputs, masks)
             
-            # Backward pass with gradient scaling
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             
-            # Update progress bar
             epoch_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             
@@ -133,7 +126,6 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
     train_criterion.to(device)
     scaler = torch.GradScaler("cuda", enabled=CFG.autocast)
     
-    # 必要な場合のみリストを初期化
     all_images = [] if save_vid else None
     all_outputs = [] if save_vid else None
     all_targets = [] if save_vid else None
@@ -147,12 +139,6 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
                 with torch.autocast("cuda", dtype=torch.float16, enabled=CFG.autocast):
                     outputs = model(images).softmax(dim=1)
                     outputs = (outputs > 0.5).int()
-                    #loss = train_criterion(outputs, masks)
-                
-                #val_loss += loss
-                #pbar.set_postfix(loss=f"{loss.mean():.4f}")
-                
-                # Store all batches
                 if save_vid:
                     for i in range(images.size(0)):
                         img = images[i].cpu().transpose(0,1).transpose(1,2).numpy()
@@ -172,10 +158,8 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
         
         if save_vid:
             vis.save_video(all_images, all_outputs, all_targets, f"log/conv_epoch_{epoch}.mp4")
-            # メモリ解放
             del all_images, all_outputs, all_targets
         
-        #val_loss /= len(loader)
         val_loss = criterion.compute()
         for i, scr in enumerate(val_loss):
             print(f"indice {i} | {float(scr):.4f}")
@@ -244,46 +228,34 @@ def main(rank=0, world_size=1):
     else:
         device = CFG.device
     
-    # Set random seeds
     torch.manual_seed(42)
     np.random.seed(42)
     
 
-    if CFG.decoder == "deeplabv3":
-        model = UNET(
-            backbone=CFG.backbone,
-            out_dim=CFG.mask_num,
-            segtype = CFG.decoder
-        )
-    else:
-        model = UNET(
-            backbone=CFG.backbone,
-            out_dim=CFG.mask_num,
-        )
-    model.load_state_dict(fix_key(torch.load(CFG.model_path)))#########
+    model = smp.DeepLabV3(
+        encoder_name=CFG.backbone, classes=CFG.mask_num
+    )
     model = model.to(device)
-    model = torch.compile(model)
     
     if CFG.use_multi_gpu:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    # データセットの準備
-    train_df = pd.read_csv("/data4/src/shunsuke/MICCAI2025/cholecseg8k_train.csv")
-    valid_df = pd.read_csv("/data4/src/shunsuke/MICCAI2025/cholecseg8k_test.csv")
+    train_df = pd.read_csv("cholecseg8k_train.csv")
+    valid_df = pd.read_csv("cholecseg8k_test.csv")
 
-    train_dataset = CholecSegDataset(train_df)
-    val_dataset = CholecSegDataset(valid_df)
-    test_dataset = CholecSegDataset(valid_df)
+    train_dataset = CholecSegDataset(train_df, transform=CFG.train_augmentation)
+    val_dataset = CholecSegDataset(valid_df, transform=None)
+    test_dataset = CholecSegDataset(valid_df, transform=None)
 
     # DataLoaderの設定
     if CFG.use_multi_gpu:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        num_workers = 16 // world_size  # ワーカー数を64から16に削減
+        num_workers = 16 // world_size 
     else:
         train_sampler = None
         val_sampler = None
-        num_workers = 32  # 単一GPU用のワーカー数も16に削減
+        num_workers = 32 
     
     train_loader = DataLoader(
         train_dataset, 
@@ -316,21 +288,14 @@ def main(rank=0, world_size=1):
         pin_memory=True
     )
     
-    # Initialize optimizer and criterion
-    from torchmetrics.segmentation import DiceScore
     optimizer = RAdamScheduleFree(model.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
     train_criterion = GeneralizedDiceFocalLoss(softmax=True)
     valid_criterion = DiceScore(num_classes=CFG.mask_num, include_background=True, average=None)
-    ##scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    #    optimizer, T_max=CFG.num_epochs, eta_min=1e-6
-    #)
     
-    # Training loop
-    epoch = 0
-    best_val_score = validate(model, val_loader, train_criterion, valid_criterion, device, epoch, save_vid=False, optimizer=optimizer)
+    best_val_score = 0
     for epoch in range(CFG.num_epochs):
         if CFG.use_multi_gpu:
-            train_sampler.set_epoch(epoch)  # エポックごとにシャッフル
+            train_sampler.set_epoch(epoch) 
             
         print(f"\nEpoch {epoch+1}/{CFG.num_epochs}")
         
@@ -340,13 +305,9 @@ def main(rank=0, world_size=1):
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_score:.4f}")
         
-        #scheduler.step(val_score)
-        
         if val_score > best_val_score:
             best_val_score = val_score
             if CFG.use_multi_gpu:
-                # When using DDP, the compiled model is wrapped as model.module.
-                # Check if the compiled model holds the original model in _orig_mod.
                 if hasattr(model.module, "_orig_mod"):
                     state_dict = model.module._orig_mod.state_dict()
                 else:
@@ -359,13 +320,11 @@ def main(rank=0, world_size=1):
             torch.save(state_dict, CFG.model_path)
             print("Saved best model!")
     
-    # Load best model
     if CFG.use_multi_gpu:
         model.module.load_state_dict(torch.load(CFG.model_path))
     else:
         model.load_state_dict(torch.load(CFG.model_path))
 
-    # Test
     test(model, test_loader, valid_criterion, device)
 
     cleanup_ddp()

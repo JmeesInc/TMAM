@@ -1,7 +1,6 @@
 # TMAM
 
-This is the official repository for Temporal Memory Augmen
-tation Module (TMAM), which enables any encoder-decoder semantic segmentation models to address temporal information in Video Segmentation. The original paper is available at [url]
+This is the official repository for Temporal Memory Augmentation Module (TMAM), which enables any encoder-decoder semantic segmentation models to address temporal information in Video Segmentation. The original paper is available at [url]
 
 ## Environmental setup
 
@@ -13,10 +12,20 @@ source .venv/bin/activate
 ## How to Use TMAM?
 
 ```python
+import sys
+sys.path.append("./sam2")
 from util.model import TMAM
+from sam2.build_sam import build_sam2_video_predictor
 
-model = TMAM(encoder, decoder, segmentation_head, depth=depth)  # where depth is the number of encoder block
+...
+
+predictor = build_sam2_video_predictor(
+        "configs/sam2.1/sam2.1_hiera_l.yaml", 
+        "sam2/checkpoints/sam2.1_hiera_large.pt",
+          device="cuda",)
+model = TMAM(encoder, decoder, segmentation_head, predictor=preductor)
 ```
+To reproduce our results, please donwloads SAR-RARP50 Dataset or CholecSeg8k Daraset here [https://www.kaggle.com/datasets/newslab/cholecseg8k]
 
 ## SAR-RARP50
 

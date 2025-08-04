@@ -1,6 +1,13 @@
-import torch
-import numpy as np
 import os
+def set_env():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "3"
+    os.environ["SAM2_BUILD_CUDA"] = "0"
+    os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
+set_env()
+
+import numpy as np
+import torch
 import cv2
 import time
 import torch.nn as nn
@@ -16,11 +23,6 @@ def set_env():
     os.environ["CUDA_LAUNCH_BLOCKING"] = "3"
     os.environ["SAM2_BUILD_CUDA"] = "0"
     os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
-    k = torch.randn(1,3,128,128)
-    k = k.cuda()
-    del k
-    torch.cuda.empty_cache()
-    gc.collect()
 
 set_env()
 
@@ -28,7 +30,7 @@ from monai.losses import DiceLoss
 from train import Dataset as TrainDataset
 
 from base_model.alt_model import TimmSegModel as UNET
-from util.converter2 import VideoSegModel ###
+from TMAM.util.model import VideoSegModel ###
 from util.data import TestDataset
 
 import sys

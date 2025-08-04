@@ -1,11 +1,21 @@
-import torch
-import numpy as np
 import os
+def set_env():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+    os.environ["SAM2_BUILD_CUDA"] = "0"
+    os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
+
+set_env()
+
+import torch
+import torch.nn.functional as F
+import numpy as np
 import cv2
 import time
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.optim as optim
+import segmentation_models_pytorch as smp
 from glob import glob
 from tqdm import tqdm
 from pathlib import Path
@@ -13,46 +23,37 @@ from torchmetrics.segmentation import MeanIoU
 import gc
 from schedulefree import RAdamScheduleFree
 
-def set_env():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-    os.environ["SAM2_BUILD_CUDA"] = "0"
-    os.environ["SAM2_BUILD_ALLOW_ERRORS"] = "0"
-    k = torch.randn(1)
-    k = k.cuda()
-    del k
-    torch.cuda.empty_cache()
-    gc.collect()
-
-set_env()
-
 from monai.losses import GeneralizedDiceFocalLoss
 from train import Dataset as TrainDataset
-
-from base_model.alt_model import TimmSegModel_v3 as UNET ###
-from TMAM.util.model import TMAM
+from torchvision.transforms.v2 import TrivialAugmentWide
+from util.model import TMAM
 from util.data import TestDataset
 
+# SAM2のインポートを修正
 import sys
 sys.path.append("./sam2")
+from sam2.build_sam import build_sam2_video_predictor
 
 class CFG:
-    backbone = "resnet101.a1h_in1k"
-    save_syntax = "resnet101_bin"
-    decoder = "deeplabv3"
-    depth = 5
+    backbone = "tu-maxvit_tiny_tf_512.in1k"
+    save_syntax = "maxvit_unet_rarp"
+    decoder = "unet"
+    depth = 4
     autocast = True
-    image_size=1024
-    data_dir = "/mnt/ssd1/EndoVis2022/train/"
-    valid_dir = "/mnt/ssd1/EndoVis2022/train/"
-    test_dir = "/mnt/ssd1/EndoVis2022/test/"
+    image_size=512
+    
+    data_dir = "SAR-RARP50/train/"
+    num_epochs = 50
+    mask_num= 10
     batch_size = 1
     accum_steps = 32
-    learning_rate = 1e-3
+    learning_rate = 1e-4
+    train_augmentation = TrivialAugmentWide()
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     debug = False
-    check_video = "/mnt/ssd1/EndoVis2022/train/video_36/"
-    model_path = "base_model/weight/ablation_resnet101_bin_2_0.4897.pth"
+    check_video = "SAR-RARP50/train/video_36/"
+    model_path = "base_model/weight/maxvit_unet_rarp.pth"
 
 def train(model, loader, optimizer, criterion, device):
     model.train()
@@ -64,70 +65,28 @@ def train(model, loader, optimizer, criterion, device):
     optimizer.zero_grad()
     with tqdm(loader, desc="Training") as pbar:
         for i, (images, masks, video_start, flag) in enumerate(loader):
-            # Move tensors to device and process
             images = images.to(device)
             masks = masks.int().to(device)
             video_start = video_start.bool().to(device)
             
             if any(video_start):
                 model.init_weights(video_start)
-            outputs = model(images)  # .softmax(dim=1) if needed
+            outputs = model(images)
             
             if flag[0]:
                 outputs = F.interpolate(outputs, size=(1024, 1024), mode="bilinear")
                 loss = criterion(outputs, masks)
-                # Normalize loss to account for gradient accumulation
                 loss = loss / accumulation_steps
                 scaler.scale(loss).backward()
                 epoch_loss += loss.item() * accumulation_steps
                 pbar.set_postfix(loss=f"{loss.item() * accumulation_steps:.4f}")
-            #else:
-                # If flag is False, we effectively skip the step (but still need a value for tracking)
-                #loss = torch.tensor(0.0, device=device)
-            
-            # Accumulate loss for progress tracking (scale back to original magnitude)
-            #epoch_loss += loss.item() * accumulation_steps
 
-            # Perform optimizer step every accumulation_steps or on the last batch
             if ((i + 1) % accumulation_steps == 0) or ((i + 1) == len(loader)):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 torch.cuda.empty_cache()
                 gc.collect()
-            pbar.update(1)
-
-def train_2d(model, loader, optimizer, criterion, device):
-    model.train()
-    turn_off_batchnorm(model)
-    gc.collect()
-    torch.cuda.empty_cache()
-    optimizer.train()
-    epoch_loss = 0
-    accumulation_steps = CFG.accum_steps
-    scaler = torch.GradScaler(enabled=CFG.autocast)
-    optimizer.zero_grad()
-    with tqdm(loader, desc="Training") as pbar:
-        for i, (images, masks, video_start, flag) in enumerate(loader):
-            # Move tensors to device and process
-            images = images.to(device)
-            masks = masks.int().to(device)
-
-            outputs = model(images)  # .softmax(dim=1) if needed
-            outputs = F.interpolate(outputs, size=(1024, 1024), mode="bilinear")
-            
-            if flag[0]:
-                loss = criterion(outputs, masks)
-                # Normalize loss to account for gradient accumulation
-                loss = loss / accumulation_steps
-                scaler.scale(loss).backward()
-                epoch_loss += loss.item() * accumulation_steps
-                pbar.set_postfix(loss=f"{loss.item() * accumulation_steps:.4f}")
-            # Perform optimizer step every accumulation_steps or on the last batch
-            if ((i + 1) % accumulation_steps == 0) or ((i + 1) == len(loader)):
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
             pbar.update(1)
 
 def validate(model, loader, criterion, device, optimizer=None):
@@ -143,7 +102,6 @@ def validate(model, loader, criterion, device, optimizer=None):
     with torch.no_grad():
         for i, (images, masks, video_start, flag) in enumerate(tqdm(loader)):
             try:
-                # Move tensors to device and process
                 images = images.to(device)
                 masks = masks.int().to(device)
                 video_start = video_start.bool().to(device)
@@ -188,8 +146,6 @@ def validate(model, loader, criterion, device, optimizer=None):
                     if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
                         del tensor
                 torch.cuda.empty_cache()
-
-    # Final validation loss computation with cleanup
     final_loss = criterion.compute()
     val_loss.append(final_loss.cpu())
     del final_loss
@@ -286,15 +242,12 @@ def test(model, loader, device):
 
             if video_start[0]:
                 save_dir = val_dirs[video_counter] + f"/video_{CFG.save_syntax}/"
-                #frame_counter = 0
-                #os.makedirs(save_dir, exist_ok=True)
                 print(f"Saving to {save_dir}")
                 video_counter += 1
             
             file_name = f"{save_dir}/{frame_counter:09d}.png"
             frame_counter += 1
             
-            # Process and save output
             with torch.no_grad():
                 tgt = F.interpolate(outputs, size=(1080, 1920), mode="bilinear")
                 tgt = torch.argmax(outputs.squeeze(), dim=0).cpu().numpy()
@@ -335,7 +288,7 @@ def turn_off_batchnorm(model):
 
 
 def create_compare_video(video_dir=CFG.check_video,
-                          out_path = f"/home/shunsuke/MICCAI2025/log/{CFG.save_syntax}_compare.mp4",
+                          out_path = f"./{CFG.save_syntax}_compare.mp4",
                             include_frame_pred = False):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     if include_frame_pred:
@@ -381,41 +334,28 @@ def create_compare_video(video_dir=CFG.check_video,
 
 def main():
     set_env()
-    model = UNET(
-        backbone=CFG.backbone,
-        segtype=CFG.decoder,
-        out_dim=10,
-    )
+    model = smp.Unet(
+        encoder_name=CFG.backbone, classes=CFG.mask_num
+        )
     model.load_state_dict(fix_key(torch.load(CFG.model_path)))
     model.to(CFG.device)
-    #model = torch.compile(model)
-    # データセットの準備
+
     train_txt = CFG.data_dir + "/train_video.txt"
     valid_txt = CFG.data_dir + "/val_video.txt"
     with open(train_txt) as f:
         train_dirs = f.readlines()
     train_dirs = [CFG.data_dir + s.replace("\n", "") for s in train_dirs]
+    train_dirs = train_dirs[1:]
     with open(valid_txt) as f:
         val_dirs = f.readlines()
     val_dirs = [CFG.data_dir + s.replace("\n", "") for s in val_dirs]
-    
-    test_dirs = sorted(glob(CFG.test_dir + "/**/"))
 
     if CFG.debug:
         train_dirs = train_dirs[1:]
         val_dirs = val_dirs[-2:]
-        test_dirs = test_dirs[-2:]
-
-    print(f"Val  dirs: {len(val_dirs)}, {val_dirs}")
-    print(f"Test dirs: {len(test_dirs)}, {test_dirs}")
 
     train_dataset = TestDataset(train_dirs, batch_size=CFG.batch_size, train=True, eval=False)
-
     val_dataset = TestDataset(val_dirs, batch_size=CFG.batch_size, eval=True)
-    test_dataset = TestDataset(test_dirs, batch_size=CFG.batch_size, eval=False)
-
-    print(f"Val  size: {len(val_dataset)}")
-    print(f"Test size: {len(test_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -438,36 +378,19 @@ def main():
     train_criterion = GeneralizedDiceFocalLoss(softmax=True)
     valid_criterion = MeanIoU(num_classes=10, per_class=True)
     val_loss = 0
-    # ablation study
-    optimizer2 = RAdamScheduleFree(model.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
-    #for epoch in range(3):
-    #    train_2d(model, train_loader, optimizer2, train_criterion, CFG.device)
-    #val_loss = validate_2d(model, val_loader, valid_criterion, CFG.device, optimizer2)
-    #torch.save(model.state_dict(), f"base_model/weight/ablation_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
-    
-    # reload model
-    #model.load_state_dict(fix_key(torch.load(CFG.model_path)))
-    sam2_checkpoint = "sam2/checkpoints/sam2.1_hiera_large.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-    from sam2.build_sam import build_sam2_video_predictor
-    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device="cuda",)
-    model2 = TMAM(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=CFG.depth)
-            # Initialize optimizer and criterion
-    #model2 = torch.compile(model2)
-    optimizer = RAdamScheduleFree(model2.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
-    # Turn off barchnorm
-    #model2.load_state_dict(fix_key(torch.load(CFG.model_path)), strict=False)
+    predictor = build_sam2_video_predictor(
+        "configs/sam2.1/sam2.1_hiera_l.yaml", 
+        "sam2/checkpoints/sam2.1_hiera_large.pt",
+          device="cuda",)
+    model = TMAM(model.encoder, model.decoder, model.segmentation_head, device="cuda", sam2_predictor=predictor, index=[i for i in range(10)], depth=CFG.depth)
+    optimizer = RAdamScheduleFree(model.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
     for epoch in range(3):
-        train(model2, train_loader, optimizer, train_criterion, CFG.device)
-        torch.save(model2.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
-        val_loss = validate(model2, val_loader, valid_criterion, CFG.device, optimizer)
-        torch.save(model2.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
-    
-    #test(model2, test_loader, CFG.device)
+        train(model, train_loader, optimizer, train_criterion, CFG.device)
+        torch.save(model.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
+        val_loss = validate(model, val_loader, valid_criterion, CFG.device, optimizer)
+        torch.save(model.state_dict(), f"base_model/weight/fine_tune_{CFG.save_syntax}_{epoch}_{val_loss:.4f}.pth")
     
     print(f"Val Loss: {val_loss:.4f}")
-
-    #create_compare_video(include_frame_pred=True)
 
 if __name__ == "__main__":
     main()

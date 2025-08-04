@@ -171,8 +171,19 @@ class TimmSegModel_v3(nn.Module):
                 n_blocks=n_blocks,
                 attention_type = None
             )
+        elif segtype == 'unet':
+            self.decoder = smp.decoders.unet.decoder.UnetDecoder(
+                encoder_channels=encoder_chs[:n_blocks+1],
+                decoder_channels=self.decoder_channels[:n_blocks],
+                n_blocks=n_blocks,
+                attention_type = None
+            )
+        else:
+            raise ValueError(f"Unsupported segmentation type: {segtype}")
+        print(encoder_chs[:n_blocks+1])
+        print(self.decoder_channels)
         fet = self.encoder(torch.randn(2, 3, 512, 512))
-        dec = self.decoder(*fet)
+        dec = self.decoder(features=fet)
         seg = self.segmentation_head(dec)
         if seg.shape[2:] != (512, 512):
             scaler_factor = 512 // seg.shape[2]
@@ -183,72 +194,9 @@ class TimmSegModel_v3(nn.Module):
                 nn.SiLU(inplace=True),
                 nn.Conv2d(64, out_dim, kernel_size=1)
             )
-    #@torch.autocast("cuda", dtype=torch.bfloat16)
     def forward(self,x):
         global_features = self.encoder(x)
-        seg_features = self.decoder(*global_features)
-        seg_features = self.segmentation_head(seg_features)
-        return seg_features
-
-class TimmSegModel_swin(nn.Module):
-    def __init__(self, backbone, segtype='unet', pretrained=True, attention_type =None, out_dim=10, in_chans=3, reshape=True):#att_type: scse
-        super(TimmSegModel_swin, self).__init__()
-
-        self.encoder, encoder_chs = get_encoder(
-            backbone=backbone,
-            pretrained=pretrained,
-            in_chans=in_chans,
-            image_size=384
-        )
-        self.decoder_channels = [512,256,128,64,32]
-        n_blocks = 4
-
-        self.segmentation_head = nn.Conv2d(self.decoder_channels[n_blocks-1], out_dim, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        
-        if segtype == 'unet':
-            self.decoder = smp.decoders.unet.decoder.UnetDecoder(
-                encoder_channels=encoder_chs[:n_blocks+1],
-                decoder_channels=self.decoder_channels[:n_blocks],
-                n_blocks=n_blocks,
-                attention_type = attention_type
-            )
-        elif segtype == 'unetpp':
-            self.decoder = smp.decoders.unetplusplus.decoder.UnetPlusPlusDecoder(
-                encoder_channels=encoder_chs[:n_blocks+1],
-                decoder_channels=self.decoder_channels[:n_blocks],
-                n_blocks=n_blocks,
-                attention_type = attention_type
-            )
-        elif segtype == 'deeplabv3':
-            self.decoder = smp.decoders.deeplabv3.decoder.DeepLabV3PlusDecoder(
-                encoder_channels=encoder_chs[:n_blocks+1],
-                out_channels=256,
-                encoder_depth=n_blocks
-            )
-        elif segtype == "segformer":
-            self.decoder = smp.decoders.segformer.decoder.SegformerDecoder(
-                encoder_channels=encoder_chs[:n_blocks+1],
-                segmentation_channels=256,
-                encoder_depth=n_blocks
-            )
-        fet = self.encoder(torch.randn(2, 3, 384, 384))[:4]
-        fet = [0] + [x.permute(0, 3, 1, 2) for x in fet]
-        dec = self.decoder(*fet)
-        seg = self.segmentation_head(dec)
-        if seg.shape[2:] != (384, 384):
-            scaler_factor = 384 // seg.shape[2]
-            print(f"output shape is {seg.shape}, scaler factor is {scaler_factor}")
-            self.segmentation_head= nn.Sequential(
-                nn.Upsample(scale_factor=scaler_factor, mode='bilinear'),
-                nn.Conv2d(self.decoder_channels[n_blocks-1], self.decoder_channels[n_blocks-1]//2, kernel_size=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(self.decoder_channels[n_blocks-1]//2, out_dim, kernel_size=1)
-            )
-    #@torch.autocast("cuda", dtype=torch.float16)
-    def forward(self,x):
-        global_features = self.encoder(x)[:4]
-        global_features = [0] + [x.permute(0, 3, 1, 2) for x in global_features]
-        seg_features = self.decoder(*global_features)
+        seg_features = self.decoder(features=global_features)
         seg_features = self.segmentation_head(seg_features)
         return seg_features
 

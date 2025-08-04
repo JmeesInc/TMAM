@@ -1,19 +1,15 @@
 import torch
 import numpy as np
 import cv2
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as BaseDataset
 from glob import glob
 from tqdm import tqdm
-from pathlib import Path
-from torchmetrics.segmentation import MeanIoU, DiceScore
+from torchmetrics.segmentation import DiceScore
+import segmentation_models_pytorch as smp
 
 from monai.losses import GeneralizedDiceFocalLoss
 from schedulefree import RAdamScheduleFree
-#from monai.metrics import MeanIoU
-import kornia.augmentation as K
 
 from util import vis
 from util.data import TestDataset
@@ -24,36 +20,39 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from collections import OrderedDict
+from torchvision.transforms.v2 import TrivialAugmentWide
 
 def set_env():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
     os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
     torch.backends.cudnn.benchmark = True
+    torch.manual_seed(42)
+    np.random.seed(42)
 
 set_env()
-from base_model.alt_model import TimmSegModel as UNET
-#from segmentation_models_pytorch import DeepLabV3Plus
 
 class CFG:
-    backbone = "maxvit_tiny_tf_512.in1k"
-    save_syntax = "maxvit_tiny_tf_512_ft"
+    backbone = "tu-maxvit_tiny_tf_512.in1k"
+    save_syntax = "maxvit_unet_rarp"
     decoder = "unet"
     depth = 4
     autocast = True
-    image_size=1024
-    data_dir = "EndoVis2022/train/"
+    image_size=512
+    
+    data_dir = "SAR-RARP50/train/"
     num_epochs = 50
-    batch_size = 8
-    learning_rate = 2e-4
+    mask_num= 10
+    batch_size = 32
+    learning_rate = 1e-4
+    train_augmentation = TrivialAugmentWide()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # マルチGPUを使用するかどうかのフラグ
     world_size = torch.cuda.device_count()
     use_multi_gpu = True if torch.cuda.device_count() > 1 else False
     dist_url = 'tcp://localhost:12355'
     dist_backend = 'nccl'
-    train_augmentation = None
-    model_path = "base_model/weight/best_model_maxvit_tiny_tf_512_2.pth"
-    mask_num=10
+
+    model_path = f"base_model/weight/{save_syntax}.pth"
 
 class Dataset(BaseDataset):
     def __init__(self, dir_list, transform=None, train=False):
@@ -101,15 +100,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     optimizer.train()
     epoch_loss = 0
-    #augmentation = CFG.train_augmentation.to(device)
     scaler = torch.GradScaler(enabled=CFG.autocast)
     
     with tqdm(loader, desc="Training") as pbar:
         for images, masks in pbar:
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-            #augmented = augmentation(images, masks)
-            #images, masks = augmented[0], augmented[1]
             
             optimizer.zero_grad()
             
@@ -137,7 +133,7 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
     train_criterion.to(device)
     scaler = torch.GradScaler("cuda", enabled=CFG.autocast)
     
-    # 必要な場合のみリストを初期化
+    
     all_images = [] if save_vid else None
     all_outputs = [] if save_vid else None
     all_targets = [] if save_vid else None
@@ -151,12 +147,6 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
                 with torch.autocast("cuda", dtype=torch.float16, enabled=CFG.autocast):
                     outputs = model(images).softmax(dim=1)
                     outputs = (outputs > 0.5).int()
-                    #loss = train_criterion(outputs, masks)
-                
-                #val_loss += loss
-                #pbar.set_postfix(loss=f"{loss.mean():.4f}")
-                
-                # Store all batches
                 if save_vid:
                     for i in range(images.size(0)):
                         img = images[i].cpu().transpose(0,1).transpose(1,2).numpy()
@@ -173,9 +163,6 @@ def validate(model, loader, train_criterion, criterion, device, epoch, save_vid=
                             all_targets.append(tgt)
                 
                 criterion.update(outputs.cpu(), masks.cpu())
-                # GPUメモリを解放
-                #del images, masks, outputs
-                #torch.cuda.empty_cache()
         
         if save_vid:
             vis.save_video(all_images, all_outputs, all_targets, f"log/conv_epoch_{epoch}.mp4")
@@ -266,29 +253,14 @@ def main(rank=0, world_size=1):
     else:
         device = CFG.device
     
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-
-    if CFG.decoder == "deeplabv3":
-        model = UNET(
-            backbone=CFG.backbone,
-            out_dim=CFG.mask_num,
-            segtype = CFG.decoder
-        )
-    else:
-        model = UNET(
-            backbone=CFG.backbone,
-            out_dim=CFG.mask_num,
+    model = smp.Unet(
+        encoder_name=CFG.backbone, classes=CFG.mask_num
         )
     model = model.to(device)
-    model = torch.compile(model)
     
     if CFG.use_multi_gpu:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
-    # データセットの準備
     train_txt = CFG.data_dir + "/train_video.txt"
     valid_txt = CFG.data_dir + "/val_video.txt"
     with open(train_txt) as f:
@@ -299,9 +271,7 @@ def main(rank=0, world_size=1):
         val_dirs = f.readlines()
     val_dirs = [CFG.data_dir + s.replace("\n", "") for s in val_dirs]
     
-    print(train_dirs)
-    train_dataset = Dataset(train_dirs, train=True)
-    print(train_dataset.image_paths[:2], train_dataset.image_paths[-2:])
+    train_dataset = Dataset(train_dirs, transform=CFG.train_augmentation, train=True)
     val_dataset = Dataset(val_dirs)
 
     test_dataset = TestDataset(val_dirs, batch_size=1, eval=True)
@@ -348,20 +318,16 @@ def main(rank=0, world_size=1):
     )
     
     # Initialize optimizer and criterion
-    from torchmetrics.segmentation import DiceScore
     optimizer = RAdamScheduleFree(model.parameters(), lr=CFG.learning_rate, betas=(0.9, 0.999))
     train_criterion = GeneralizedDiceFocalLoss(softmax=True)
     valid_criterion = DiceScore(num_classes=CFG.mask_num, include_background=True, average=None)
-    ##scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    #    optimizer, T_max=CFG.num_epochs, eta_min=1e-6
-    #)
-    
     # Training loop
     epoch = 0
-    best_val_score = validate(model, val_loader, train_criterion, valid_criterion, device, epoch, save_vid=False, optimizer=optimizer)
+    best_val_score = 0.0
+    os.makedirs(os.path.dirname(CFG.model_path), exist_ok=True)
     for epoch in range(CFG.num_epochs):
         if CFG.use_multi_gpu:
-            train_sampler.set_epoch(epoch)  # エポックごとにシャッフル
+            train_sampler.set_epoch(epoch)
             
         print(f"\nEpoch {epoch+1}/{CFG.num_epochs}")
         
@@ -371,13 +337,10 @@ def main(rank=0, world_size=1):
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_score:.4f}")
         
-        #scheduler.step(val_score)
         
         if val_score > best_val_score:
             best_val_score = val_score
             if CFG.use_multi_gpu:
-                # When using DDP, the compiled model is wrapped as model.module.
-                # Check if the compiled model holds the original model in _orig_mod.
                 if hasattr(model.module, "_orig_mod"):
                     state_dict = model.module._orig_mod.state_dict()
                 else:
@@ -390,7 +353,6 @@ def main(rank=0, world_size=1):
             torch.save(state_dict, CFG.model_path)
             print("Saved best model!")
     
-    # Load best model
     if CFG.use_multi_gpu:
         model.module.load_state_dict(torch.load(CFG.model_path))
     else:
