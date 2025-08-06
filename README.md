@@ -1,7 +1,7 @@
 # TMAM
 
 This is the official repository for Temporal Memory Augmentation Module (TMAM), which enables any encoder-decoder semantic segmentation models to address temporal information in Video Segmentation. The original paper is available at [url]
-
+As the supplemental material, the inference movie is available [here](https://drive.google.com/file/d/1Y9qyMr7VWfpyzTdfXWfc64IiFhmwxKDA/view?usp=drive_link). Input, w/ TMAM, w/o TMAM, GT, from left to right. 
 ## Environmental setup
 
 ```bash
